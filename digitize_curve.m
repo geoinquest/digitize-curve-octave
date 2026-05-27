@@ -1,9 +1,16 @@
-function xy = digitize_curve(x_range, y_range, image_file)
+function xy = digitize_curve(x_range, y_range, image_file, csv_file, verbose)
   % Digitize a curve from an image using four plot-corner clicks.
   %
   % Usage:
   %   xy = digitize_curve([xleft xright], [ybottom ytop]);
   %   xy = digitize_curve([xleft xright], [ybottom ytop], "my_plot.png");
+  %   xy = digitize_curve([xleft xright], [ybottom ytop], ...
+  %                       "my_plot.png", "digitized_curve.csv");
+  %   xy = digitize_curve([xleft xright], [ybottom ytop], ...
+  %                       "my_plot.png", "digitized_curve.csv", true);
+  %
+  % CSV export is optional. Omit the fourth argument, or pass [], to skip
+  % writing a CSV file.
   %
   % Corner click order:
   %   1. lower-left  corner of plot area
@@ -17,7 +24,7 @@ function xy = digitize_curve(x_range, y_range, image_file)
   endif
 
   if nargin < 2
-    error("Usage: xy = digitize_curve([xleft xright], [ybottom ytop], optional_image_file)");
+    error("Usage: xy = digitize_curve([xleft xright], [ybottom ytop], optional_image_file, optional_csv_file, optional_verbose)");
   endif
 
   x_range = validate_range(x_range, "x");
@@ -27,9 +34,18 @@ function xy = digitize_curve(x_range, y_range, image_file)
   ybottom = y_range(1);
   ytop = y_range(2);
 
-  if nargin < 3 || isempty(image_file)
-    image_file = choose_default_png();
+  if nargin < 5
+    verbose = false;
   endif
+  verbose = validate_verbose(verbose);
+
+  if nargin < 3 || isempty(image_file)
+    image_file = choose_default_png(verbose);
+  endif
+  if nargin < 4
+    csv_file = [];
+  endif
+  csv_file = validate_optional_csv_file(csv_file);
 
   if ! exist(image_file, "file")
     error("Image file not found: %s", image_file);
@@ -47,24 +63,44 @@ function xy = digitize_curve(x_range, y_range, image_file)
   title(sprintf("Image: %s", image_file), "interpreter", "none");
 
   corners = pick_plot_corners(xleft, xright, ybottom, ytop, size(img));
-  curve_px = pick_curve_points();
+  curve_px = pick_curve_points(verbose);
 
   if isempty(curve_px)
     xy = zeros(0, 2);
-    disp("No curve points were captured.");
+    if verbose
+      disp("No curve points were captured.");
+    endif
     return;
   endif
 
-  uv = image_to_unit_square(curve_px, corners);
+  uv = image_to_unit_square(curve_px, corners, xleft, xright, ...
+                            ybottom, ytop, size(img));
   xy = [xleft + uv(:, 1) .* (xright - xleft), ...
         ybottom + uv(:, 2) .* (ytop - ybottom)];
+  xy = round_to_pixel_resolution(xy, xleft, xright, ybottom, ytop, ...
+                                 size(img), corners);
 
-  csv_file = "digitized_curve.csv";
-  write_xy_csv(csv_file, xy);
+  [dx, dy, plot_width_px, plot_height_px] = estimate_pixel_resolution( ...
+    xleft, xright, ybottom, ytop, size(img), corners);
 
-  disp("Digitized XY points:");
-  disp(xy);
-  fprintf("Saved %d points to %s\n", rows(xy), csv_file);
+  annotate_results_on_image(size(img), xy, dx, dy, ...
+                            plot_width_px, plot_height_px);
+
+  if verbose
+    fprintf("%s\n", format_results_text(xy, dx, dy, plot_width_px, ...
+                                        plot_height_px, rows(xy)));
+  endif
+
+  if ! isempty(csv_file)
+    write_xy_csv(csv_file, xy);
+    if verbose
+      fprintf("Saved %d points to %s\n", rows(xy), csv_file);
+    endif
+  else
+    if verbose
+      disp("CSV export skipped.");
+    endif
+  endif
 endfunction
 
 function uv = run_selftest()
@@ -95,12 +131,27 @@ function uv = run_selftest()
     115, 60
   ];
 
-  uv = image_to_unit_square(pts, corners);
+  uv = image_to_unit_square(pts, corners, 0, 10, 20, 80, [100, 220]);
   assert(uv(1, :), [0, 0], 1e-9);
   assert(uv(2, :), [1, 0], 1e-9);
   assert(uv(3, :), [1, 1], 1e-9);
   assert(uv(4, :), [0, 1], 1e-9);
   assert(uv(5, :), [0.5, 0.5], 1e-9);
+
+  rounded = round_to_pixel_resolution([0.49, 20.49; 9.51, 79.51], ...
+                                      0, 10, 20, 80, [100, 220], corners);
+  [dx, dy] = estimate_pixel_resolution(0, 10, 20, 80, [100, 220], corners);
+  expected = [round(0.49 / dx) * dx, 20 + round(0.49 / dy) * dy; ...
+              round(9.51 / dx) * dx, 20 + round(59.51 / dy) * dy];
+  assert(rounded, expected, 1e-9);
+
+  assert(display_decimals_for_step(1), 0);
+  assert(display_decimals_for_step(0.25), 2);
+  assert(display_decimals_for_step(0.001), 3);
+
+  result_text = format_results_text([1.25, 20.5], 0.25, 0.5, 40, 120, 1);
+  assert(! isempty(strfind(result_text, "1.25")));
+  assert(! isempty(strfind(result_text, "20.5")));
 endfunction
 
 function write_xy_csv(csv_file, xy)
@@ -128,7 +179,7 @@ function write_xy_csv(csv_file, xy)
   end_unwind_protect
 endfunction
 
-function image_file = choose_default_png()
+function image_file = choose_default_png(verbose)
   % Pick the image file when the caller did not pass one explicitly.
   %
   % This keeps the common case short:
@@ -141,7 +192,9 @@ function image_file = choose_default_png()
     error("No PNG files found in the current folder.");
   elseif numel(pngs) == 1
     image_file = pngs(1).name;
-    fprintf("Using PNG file: %s\n", image_file);
+    if verbose
+      fprintf("Using PNG file: %s\n", image_file);
+    endif
   else
     fprintf("PNG files in this folder:\n");
     for k = 1:numel(pngs)
@@ -170,6 +223,37 @@ function range = validate_range(range, axis_name)
   endif
 
   range = range(:).';
+endfunction
+
+function csv_file = validate_optional_csv_file(csv_file)
+  % Validate the optional CSV output path.
+  %
+  % Empty means "do not export". A non-empty value must be a character string
+  % containing the filename or path to write. Parent folders must already
+  % exist; write_xy_csv() will report an error if fopen() cannot create the
+  % file.
+  if isempty(csv_file)
+    csv_file = [];
+    return;
+  endif
+
+  if ! ischar(csv_file)
+    error("optional_csv_file must be a filename/path string, or [] to skip export.");
+  endif
+endfunction
+
+function verbose = validate_verbose(verbose)
+  % Validate the optional console-output flag.
+  %
+  % false is the default. When false, the script avoids command-window status
+  % output from disp()/fprintf(). The figure annotations are still drawn, and
+  % any required interactive prompts for choosing among multiple images remain
+  % visible because the user must answer them.
+  if ! (islogical(verbose) || isnumeric(verbose)) || ! isscalar(verbose)
+    error("optional_verbose must be true or false.");
+  endif
+
+  verbose = logical(verbose);
 endfunction
 
 function prepare_annotation_panel(img_size)
@@ -303,7 +387,7 @@ function annotate_corner(k, corner_name, pixel_coord, data_coord, img_size, colo
        "verticalalignment", "top");
 endfunction
 
-function pts = pick_curve_points()
+function pts = pick_curve_points(verbose)
   % Interactively collect points along the curve.
   %
   % Mouse controls:
@@ -340,7 +424,9 @@ function pts = pick_curve_points()
         pts(end, :) = [];
       endif
     else
-      fprintf("Ignoring button/key code %g. Use MB1, MB2, or MB3.\n", button);
+      if verbose
+        fprintf("Ignoring button/key code %g. Use MB1, MB2, or MB3.\n", button);
+      endif
     endif
 
     % Refresh the cyan preview after every add/remove operation.
@@ -380,7 +466,8 @@ function [h_pts, h_line] = redraw_curve_selection(pts, h_pts, h_line)
   endif
 endfunction
 
-function uv = image_to_unit_square(pts, corners)
+function uv = image_to_unit_square(pts, corners, xleft, xright, ...
+                                   ybottom, ytop, img_size)
   % Convert image points into normalized plot coordinates.
   %
   % Output uv has the same number of rows as pts:
@@ -391,14 +478,186 @@ function uv = image_to_unit_square(pts, corners)
   % user-supplied x/y ranges.
   uv = zeros(rows(pts), 2);
 
+  % Estimate the smallest meaningful normalized-coordinate change from one
+  % pixel of picking uncertainty. This value is later used to avoid treating
+  % numerically tiny Newton updates as meaningful when they are far below the
+  % precision of the user's mouse click.
+  pick_tol = estimate_pick_precision(xleft, xright, ybottom, ytop, ...
+                                     img_size, corners);
+
   % Each point is inverted independently because a skewed four-corner mapping
   % is bilinear, not a single global linear matrix.
   for k = 1:rows(pts)
-    uv(k, :) = inverse_bilinear_point(pts(k, :), corners);
+    uv(k, :) = inverse_bilinear_point(pts(k, :), corners, pick_tol);
   endfor
 endfunction
 
-function uv = inverse_bilinear_point(pt, corners)
+function pick_tol = estimate_pick_precision(xleft, xright, ybottom, ytop, ...
+                                            img_size, corners)
+  % Estimate numerical tolerances implied by one-pixel picking precision.
+  %
+  % The clicked point cannot be more precise than roughly one image pixel.
+  % Converted to data units, that is about:
+  %   dx ~= abs(xright - xleft) / plot_width_pixels
+  %   dy ~= abs(ytop - ybottom) / plot_height_pixels
+  %
+  % rcond(jacobian) itself is dimensionless, so this helper normalizes those
+  % data errors by the data span in each direction. That converts back to
+  % about 1 / plot_width_pixels or 1 / plot_height_pixels, which is much more
+  % realistic than 1e-12 for hand-picked points.
+  x_span = abs(xright - xleft);
+  y_span = abs(ytop - ybottom);
+  [x_data_per_pixel, y_data_per_pixel] = estimate_pixel_resolution( ...
+    xleft, xright, ybottom, ytop, img_size, corners);
+
+  pick_tol = max([sqrt(eps), x_data_per_pixel / x_span, ...
+                  y_data_per_pixel / y_span]);
+endfunction
+
+function xy = round_to_pixel_resolution(xy, xleft, xright, ybottom, ytop, ...
+                                        img_size, corners)
+  % Round digitized coordinates to the nearest one-pixel data increment.
+  %
+  % The raw bilinear interpolation can produce many decimal places, but the
+  % underlying mouse picks are only meaningful to about one image pixel. Round
+  % x values to the nearest dx grid and y values to the nearest dy grid, where
+  % dx/dy come from the calibrated plot size.
+  %
+  % The grid is anchored at xleft and ybottom rather than at zero. This keeps
+  % the calibrated plot corners exactly on-grid even when the axes do not
+  % start at zero.
+  [dx, dy] = estimate_pixel_resolution(xleft, xright, ybottom, ytop, ...
+                                       img_size, corners);
+
+  xy(:, 1) = xleft + round((xy(:, 1) - xleft) ./ dx) .* dx;
+  xy(:, 2) = ybottom + round((xy(:, 2) - ybottom) ./ dy) .* dy;
+endfunction
+
+function annotate_results_on_image(img_size, xy, dx, dy, ...
+                                   plot_width_px, plot_height_px)
+  % Display the resolution estimate and digitized point table in the side
+  % panel, below the four picked-corner annotations.
+  %
+  % The image panel and verbose command-window output share format_results_text
+  % so the visible numbers and per-column precision stay harmonized.
+  img_height = img_size(1);
+  img_width = img_size(2);
+  label_x = img_width + 18;
+  label_y = 305;
+  line_height_px = 14;
+
+  % Leave room for the heading, resolution lines, table header, and a possible
+  % "... more" note. The remaining vertical space determines how many XY rows
+  % can be displayed without falling off the figure.
+  reserved_lines = 7;
+  max_rows = floor((img_height - label_y - 20) / line_height_px) ...
+             - reserved_lines;
+  max_rows = max(max_rows, 0);
+  label = format_results_text(xy, dx, dy, plot_width_px, plot_height_px, ...
+                              max_rows);
+
+  text(label_x, label_y, label, ...
+       "color", [0.05, 0.05, 0.05], "fontname", "monospace", ...
+       "fontsize", 8, "interpreter", "none", ...
+       "verticalalignment", "top");
+endfunction
+
+function label = format_results_text(xy, dx, dy, plot_width_px, ...
+                                     plot_height_px, max_rows)
+  % Build the shared result display for the image panel and verbose console.
+  %
+  % x and y get separate fixed-point precision because dx and dy can differ by
+  % orders of magnitude. Since points are already rounded to nearest dx/dy,
+  % the display should not imply extra precision beyond that resolution.
+  x_decimals = display_decimals_for_step(dx);
+  y_decimals = display_decimals_for_step(dy);
+  x_width = max(10, x_decimals + 6);
+  y_width = max(10, y_decimals + 6);
+
+  x_fmt = sprintf("%%%d.%df", x_width, x_decimals);
+  y_fmt = sprintf("%%%d.%df", y_width, y_decimals);
+  row_fmt = sprintf("%%4d  %s  %s\n", x_fmt, y_fmt);
+
+  rows_to_show = min(rows(xy), max_rows);
+
+  label = sprintf(["Resolution estimate\n", ...
+                   "dx ~= %.6g / pixel (%.1f px)\n", ...
+                   "dy ~= %.6g / pixel (%.1f px)\n\n", ...
+                   "Digitized XY points\n", ...
+                   "(rounded to dx, dy)\n", ...
+                   "%4s  %*s  %*s\n"], ...
+                  dx, plot_width_px, dy, plot_height_px, ...
+                  "#", x_width, "x", y_width, "y");
+
+  for k = 1:rows_to_show
+    label = [label, sprintf(row_fmt, k, xy(k, 1), xy(k, 2))];
+  endfor
+
+  if rows_to_show < rows(xy)
+    label = [label, sprintf("... %d more rows", rows(xy) - rows_to_show)];
+  endif
+endfunction
+
+function decimals = display_decimals_for_step(step)
+  % Choose fixed decimal places from a one-pixel data step.
+  %
+  % For example:
+  %   step = 1      -> 0 decimals
+  %   step = 0.1    -> 1 decimal
+  %   step = 0.25   -> 2 decimals
+  %   step = 0.025  -> 3 decimals
+  %   step = 0.001  -> 3 decimals
+  %
+  % The small floor avoids log10(0). One extra decimal is added when the
+  % base precision would hide non-power-of-ten steps such as 0.25. This keeps
+  % skewed plots from producing huge decimal counts while still showing the
+  % resolution scale clearly.
+  step = max(abs(step), realmin);
+  decimals = max(0, ceil(-log10(step)));
+
+  scaled_step = step * 10^decimals;
+  if abs(scaled_step - round(scaled_step)) > 1e-8
+    decimals += 1;
+  endif
+
+  decimals = min(decimals, 8);
+endfunction
+
+function [dx, dy, plot_width_px, plot_height_px] = estimate_pixel_resolution( ...
+    xleft, xright, ybottom, ytop, img_size, corners)
+  % Translate one image pixel into approximate data-coordinate increments.
+  %
+  % The plot area may not fill the whole PNG, so use the clicked plot corners
+  % to estimate the horizontal and vertical plot lengths in pixels. For a
+  % slightly skewed plot, average opposite sides:
+  %   width  = mean(bottom edge length, top edge length)
+  %   height = mean(left edge length, right edge length)
+  %
+  % If the corner geometry is degenerate, fall back to the whole image size so
+  % the caller still gets a finite estimate.
+  img_height = max(img_size(1), 1);
+  img_width = max(img_size(2), 1);
+
+  bottom_width_px = norm(corners(2, :) - corners(1, :));
+  top_width_px = norm(corners(3, :) - corners(4, :));
+  left_height_px = norm(corners(4, :) - corners(1, :));
+  right_height_px = norm(corners(3, :) - corners(2, :));
+
+  plot_width_px = mean([bottom_width_px, top_width_px]);
+  plot_height_px = mean([left_height_px, right_height_px]);
+
+  if ! isfinite(plot_width_px) || plot_width_px < 1
+    plot_width_px = img_width;
+  endif
+  if ! isfinite(plot_height_px) || plot_height_px < 1
+    plot_height_px = img_height;
+  endif
+
+  dx = abs(xright - xleft) / plot_width_px;
+  dy = abs(ytop - ybottom) / plot_height_px;
+endfunction
+
+function uv = inverse_bilinear_point(pt, corners, pick_tol)
   % Invert the bilinear map from normalized plot coordinates to image pixels.
   %
   % Forward map:
@@ -412,6 +671,12 @@ function uv = inverse_bilinear_point(pt, corners)
   % Because the user may click a skewed quadrilateral, u/v cannot always be
   % recovered with one affine solve. This helper starts with an affine guess
   % and refines it with Newton iterations.
+  %
+  % pick_tol is the dimensionless tolerance implied by one-pixel picking
+  % precision after considering the x/y ranges, clicked plot size, and image
+  % size fallback. It is used in two places:
+  %   1. stop Newton iteration when residual is below about one pixel
+  %   2. switch to pinv() when rcond(jacobian) is below meaningful precision
   p00 = corners(1, :);
   p10 = corners(2, :);
   p11 = corners(3, :);
@@ -442,8 +707,9 @@ function uv = inverse_bilinear_point(pt, corners)
     % Residual is how far the current mapped point is from the clicked point.
     residual = (mapped - pt).';
 
-    % Stop once the image-space error is essentially zero.
-    if norm(residual) < 1e-10
+    % Stop once the image-space error is below about one picked pixel. Solving
+    % further would only chase precision the clicked point does not have.
+    if norm(residual) < 1
       break;
     endif
 
@@ -453,9 +719,11 @@ function uv = inverse_bilinear_point(pt, corners)
     dpdv = (1 - u) * (p01 - p00) + u * (p11 - p10);
     jacobian = [dpdu(:), dpdv(:)];
 
-    % If the local geometry is nearly singular, use a pseudo-inverse instead
-    % of a direct solve so the code degrades gracefully.
-    if rcond(jacobian) < 1e-12
+    % If the local geometry is poorly conditioned relative to the precision
+    % of the picked points, use a pseudo-inverse. A hardcoded value such as
+    % 1e-12 is far below the practical precision of a hand click; pick_tol is
+    % derived from x range, y range, clicked plot size, and image dimensions.
+    if rcond(jacobian) < pick_tol
       step = pinv(jacobian) * residual;
     else
       step = jacobian \ residual;
@@ -463,6 +731,12 @@ function uv = inverse_bilinear_point(pt, corners)
 
     % Newton update: subtract the correction from the current estimate.
     uv = uv - step.';
+
+    % If the update is smaller than the normalized one-pixel uncertainty,
+    % another iteration cannot improve the digitized data meaningfully.
+    if norm(step) < pick_tol
+      break;
+    endif
   endfor
 endfunction
 
