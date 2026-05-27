@@ -12,3 +12,6 @@ Octave script that digitizes curve data from an image (plot, map, ...)
 - outputs a Nx2 array (X, Y values)
 - Added comments to helper functions.
 - Verified Octave self-test passes on macos
+
+
+Usage: xy= digitize_curve( [0,70], [5486,0]) to use the default image
