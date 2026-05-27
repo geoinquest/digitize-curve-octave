@@ -10,6 +10,8 @@ Octave script that digitizes curve data from an image (plot, map, ...)
 - Uses MB1/MB2/MB3 for add/remove/finish curve capture.
 - Converts picked image points to real XY coordinates.
 - outputs a Nx2 array (X, Y values)
+- optional image input as 3rd argument
+- optional CSV output name/path as 4th argument
 - Added comments to helper functions.
 - Verified Octave self-test passes on macos
 
